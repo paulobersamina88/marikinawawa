@@ -4,8 +4,6 @@ from datetime import datetime
 import pandas as pd
 import requests
 import streamlit as st
-import folium
-from streamlit_folium import st_folium
 
 st.set_page_config(
     page_title="Marikina River + Upper Wawa Forecast",
@@ -38,27 +36,6 @@ RAIN_POINTS = {
     "San Jose, Antipolo": (14.61944, 121.28194),
     "Tanay, Rizal": (14.49850, 121.28560),
     "Marikina": (14.65070, 121.10290),
-}
-
-# Map coordinates for operational visualization. Upper Wawa is based on the
-# mapped Upper Wawa Dam location. Downstream gauge coordinates are initial
-# approximate plotting points and should be replaced with verified station
-# coordinates when available; they do not affect the hydraulic calculations.
-WAWA_DAM_COORD = (14.70072, 121.20310)
-STATION_MAP_COORDS = {
-    "Montalban": (14.7315, 121.1510),
-    "Rodriguez": (14.7160, 121.1260),
-    "Nangka": (14.6830, 121.1085),
-    "Sto Nino": (14.6507, 121.1029),
-    "Tumana Bridge": (14.6715, 121.0965),
-}
-
-MAP_STATUS_COLORS = {
-    "NORMAL": "green",
-    "ALERT": "orange",
-    "ALARM": "red",
-    "CRITICAL": "darkred",
-    "Unknown": "gray",
 }
 
 DEFAULT_STATIONS = pd.DataFrame(
@@ -306,161 +283,6 @@ def scenario_summary(stage_df: pd.DataFrame, stations: pd.DataFrame, scenario_na
             "peak_status": peak["status"],
         })
     return pd.DataFrame(rows)
-
-
-def build_forecast_map(
-    operational: pd.DataFrame,
-    stations: pd.DataFrame,
-    forecast: pd.DataFrame,
-    current_wawa_el: float,
-    fsl_m: float,
-    initial_spill: float,
-    peak_wawa_el: float,
-    peak_spill_cms: float,
-    peak_spill_time,
-):
-    """Create a FloodWatch-style interactive map for Wawa-to-Marikina monitoring."""
-    m = folium.Map(
-        location=[14.67, 121.145],
-        zoom_start=11,
-        tiles="OpenStreetMap",
-        control_scale=True,
-    )
-
-    # Schematic river/gauge connection. This is a monitoring-path visualization,
-    # not a surveyed river centerline.
-    route_points = [WAWA_DAM_COORD]
-    for station_name in ["Montalban", "Rodriguez", "Nangka", "Sto Nino", "Tumana Bridge"]:
-        if station_name in STATION_MAP_COORDS:
-            route_points.append(STATION_MAP_COORDS[station_name])
-    folium.PolyLine(
-        route_points,
-        color="#2563eb",
-        weight=4,
-        opacity=0.60,
-        dash_array="8,6",
-        tooltip="Upper Wawa → downstream monitoring sequence (schematic)",
-    ).add_to(m)
-
-    dam_group = folium.FeatureGroup(name="Upper Wawa Dam", show=True)
-    spill_state = "SPILLING" if float(current_wawa_el) >= float(fsl_m) else "BELOW FSL"
-    dam_popup = f"""
-    <div style='font-size:13px;min-width:255px'>
-      <b>Upper Wawa Dam</b><br>
-      State: <b>{spill_state}</b><br>
-      Current EL: <b>{current_wawa_el:.2f} m</b><br>
-      Spill crest/FSL: {fsl_m:.2f} m<br>
-      Assumed current spill: <b>{initial_spill:.0f} m³/s</b><br>
-      Likely max EL: <b>{peak_wawa_el:.2f} m</b><br>
-      Likely max spill: <b>{peak_spill_cms:.0f} m³/s</b><br>
-      Max-spill timing: <b>{pd.Timestamp(peak_spill_time).strftime('%b %d, %I:%M %p')} PHT</b><br>
-      <small>Spill discharge is from the app's assumed temporary rating curve.</small>
-    </div>
-    """
-    folium.Marker(
-        location=list(WAWA_DAM_COORD),
-        tooltip=f"Upper Wawa | {spill_state} | {initial_spill:.0f} m³/s",
-        popup=folium.Popup(dam_popup, max_width=360),
-        icon=folium.Icon(color="blue", icon="tint", prefix="fa"),
-    ).add_to(dam_group)
-    dam_group.add_to(m)
-
-    station_group = folium.FeatureGroup(name="Forecast River Stations", show=True)
-    meta = stations.set_index("station")
-    for _, row in operational.iterrows():
-        name = row["station"]
-        if name not in STATION_MAP_COORDS or name not in meta.index:
-            continue
-        sm = meta.loc[name]
-        status = str(row.get("likely_status", "Unknown"))
-        color = MAP_STATUS_COLORS.get(status, "gray")
-        rise = max(float(row.get("likely_rise_m", 0.0) or 0.0), 0.0)
-        radius = 8 + min(rise * 9.0, 22.0)
-
-        popup = f"""
-        <div style='font-size:13px;min-width:280px'>
-          <b>{name}</b><br>
-          Likely status: <b>{status}</b><br>
-          Current EL: <b>{float(row['current_el_m']):.2f} m</b><br>
-          Expected rise: <b>+{rise:.2f} m</b><br>
-          Low peak: {float(row['low_peak_m']):.2f} m<br>
-          Likely peak: <b>{float(row['likely_peak_m']):.2f} m</b><br>
-          High peak: {float(row['high_peak_m']):.2f} m<br>
-          Likely peak time: <b>{row['likely_peak_time']} PHT</b><br><br>
-          Alert: {float(sm['alert_el_m']):.2f} m<br>
-          Alarm: {float(sm['alarm_el_m']):.2f} m<br>
-          Critical: {float(sm['critical_el_m']):.2f} m<br>
-          <small>Marker size represents predicted rise; color represents likely peak status.</small>
-        </div>
-        """
-        folium.CircleMarker(
-            location=list(STATION_MAP_COORDS[name]),
-            radius=radius,
-            color=color,
-            fill=True,
-            fill_color=color,
-            fill_opacity=0.65,
-            weight=3,
-            tooltip=(
-                f"{name} | {status} | current {float(row['current_el_m']):.2f} m → "
-                f"likely {float(row['likely_peak_m']):.2f} m (+{rise:.2f} m)"
-            ),
-            popup=folium.Popup(popup, max_width=390),
-        ).add_to(station_group)
-    station_group.add_to(m)
-
-    rain_group = folium.FeatureGroup(name="120h Rainfall Nodes", show=True)
-    for area, coords in RAIN_POINTS.items():
-        total = float(forecast[area].sum()) if area in forecast.columns else 0.0
-        peak = float(forecast[area].max()) if area in forecast.columns else 0.0
-        if area in forecast.columns and len(forecast):
-            idx = forecast[area].idxmax()
-            peak_time = pd.Timestamp(forecast.loc[idx, "time"]).strftime("%b %d, %I:%M %p")
-        else:
-            peak_time = "No data"
-        rr = 7 + min(total / 12.0, 18.0)
-        popup = f"""
-        <div style='font-size:13px;min-width:230px'>
-          <b>{area} rainfall node</b><br>
-          Next 120h total: <b>{total:.1f} mm</b><br>
-          Peak hourly rain: <b>{peak:.1f} mm/h</b><br>
-          Peak forecast time: {peak_time} PHT<br>
-          <small>Open-Meteo point forecast; not an official PAGASA gauge.</small>
-        </div>
-        """
-        folium.CircleMarker(
-            location=list(coords),
-            radius=rr,
-            color="cadetblue",
-            fill=True,
-            fill_color="cadetblue",
-            fill_opacity=0.25,
-            weight=2,
-            tooltip=f"{area} | 120h rain {total:.1f} mm | peak {peak:.1f} mm/h",
-            popup=folium.Popup(popup, max_width=330),
-        ).add_to(rain_group)
-    rain_group.add_to(m)
-
-    legend = """
-    <div style="position: fixed; bottom: 35px; left: 35px; z-index: 9999;
-                background: white; border: 2px solid #94a3b8; border-radius: 8px;
-                padding: 10px 12px; font-size: 12px; box-shadow: 0 1px 5px rgba(0,0,0,.2);">
-      <b>Likely peak status</b><br>
-      <span style='color:green'>●</span> Normal &nbsp;
-      <span style='color:orange'>●</span> Alert<br>
-      <span style='color:red'>●</span> Alarm &nbsp;
-      <span style='color:darkred'>●</span> Critical<br>
-      <span style='color:cadetblue'>●</span> Rainfall node<br>
-      <small>Station marker size = predicted rise</small>
-    </div>
-    """
-    m.get_root().html.add_child(folium.Element(legend))
-    folium.LayerControl(collapsed=False).add_to(m)
-
-    all_points = [WAWA_DAM_COORD] + list(STATION_MAP_COORDS.values()) + list(RAIN_POINTS.values())
-    m.fit_bounds([[min(p[0] for p in all_points), min(p[1] for p in all_points)],
-                  [max(p[0] for p in all_points), max(p[1] for p in all_points)]], padding=(25, 25))
-    return m
 
 
 # -----------------------------------------------------------------------------
@@ -731,28 +553,6 @@ for station in stations["station"]:
 operational = pd.DataFrame(rows)
 st.dataframe(operational, use_container_width=True, hide_index=True)
 
-st.subheader("5) Upper Wawa → Marikina Forecast Map")
-st.caption(
-    "Interactive monitoring map: river-station color = likely peak status; marker size = predicted rise. "
-    "Rainfall nodes and Upper Wawa can be switched on/off in the layer control."
-)
-forecast_map = build_forecast_map(
-    operational=operational,
-    stations=stations,
-    forecast=forecast,
-    current_wawa_el=current_wawa_el,
-    fsl_m=fsl_m,
-    initial_spill=initial_spill,
-    peak_wawa_el=float(peak_level_row["wawa_level_m"]),
-    peak_spill_cms=float(peak_spill_row["spill_cms"]),
-    peak_spill_time=peak_spill_row["time"],
-)
-st_folium(forecast_map, width=None, height=610, returned_objects=[])
-st.caption(
-    "Map note: Upper Wawa uses a mapped dam coordinate. Downstream station points are initial approximate plotting locations for visualization only; "
-    "they do not affect the forecast calculation and should be replaced with verified gauge coordinates when available."
-)
-
 selected_station = st.selectbox("Station hydrograph", stations["station"].tolist(), index=min(3, len(stations)-1))
 station_meta = stations[stations["station"] == selected_station].iloc[0]
 
@@ -773,7 +573,7 @@ component_chart = selected_likely[["wawa_rise_m", "local_rain_rise_m", "rise_m"]
 st.markdown("**Likely predicted rise decomposition**")
 st.line_chart(component_chart, height=280)
 
-st.subheader("6) Calibration / Interpretation")
+st.subheader("5) Calibration / Interpretation")
 st.markdown(
     """
 **How to improve this after each real rain event:**
