@@ -1,9 +1,14 @@
 import math
+import re
+import unicodedata
 from datetime import datetime
 
 import pandas as pd
 import requests
 import streamlit as st
+from bs4 import BeautifulSoup
+import folium
+from streamlit_folium import st_folium
 
 st.set_page_config(
     page_title="Marikina River + Upper Wawa Forecast",
@@ -16,6 +21,7 @@ st.set_page_config(
 # -----------------------------------------------------------------------------
 TZ = "Asia/Manila"
 FORECAST_HOURS = 120
+BUILD_ID = "2026-08-09-PAGASA-PASTE-FALLBACK-v4"
 
 # User-requested declared Upper Wawa catchment area used for rainfall-runoff.
 WAWA_CATCHMENT_KM2 = 262.0
@@ -38,25 +44,348 @@ RAIN_POINTS = {
     "Marikina": (14.65070, 121.10290),
 }
 
+# Map coordinates for operational visualization. Upper Wawa is based on the
+# mapped Upper Wawa Dam location. Downstream gauge coordinates are initial
+# approximate plotting points and should be replaced with verified station
+# coordinates when available; they do not affect the hydraulic calculations.
+WAWA_DAM_COORD = (14.70072, 121.20310)
+STATION_MAP_COORDS = {
+    "Montalban": (14.7315, 121.1510),
+    "Rodriguez": (14.7160, 121.1260),
+    "Nangka": (14.6830, 121.1085),
+    "Sto Nino": (14.6507, 121.1029),
+    "Tumana Bridge": (14.6715, 121.0965),
+}
+
+MAP_STATUS_COLORS = {
+    "NORMAL": "green",
+    "ALERT": "orange",
+    "ALARM": "red",
+    "CRITICAL": "darkred",
+    "Unknown": "gray",
+}
+
 DEFAULT_STATIONS = pd.DataFrame(
     [
-        # Current values below are placeholders carried from the user's working dataset.
-        # Replace them in the app with the latest PAGASA values before interpreting results.
-        {"station": "Montalban", "current_el_m": 24.98, "alert_el_m": 22.40, "alarm_el_m": 23.00, "critical_el_m": 23.60,
+        # IMPORTANT: Current EL is intentionally blank. The app must obtain it
+        # from the official PAGASA Water Level Map, an exact table pasted from
+        # that page, or a deliberate manual override. Old sample EL values are
+        # never silently reused. Warning thresholds are static starting values
+        # and are overwritten whenever the official table supplies them.
+        {"station": "Montalban", "current_el_m": None, "alert_el_m": 22.40, "alarm_el_m": 23.00, "critical_el_m": 23.60,
          "lag_hr": 1, "attenuation": 0.96, "stage_m_per_100cms": 0.11, "local_rain_m_per_10mm": 0.05},
-        {"station": "Rodriguez", "current_el_m": 29.81, "alert_el_m": 28.80, "alarm_el_m": 29.80, "critical_el_m": 30.70,
+        {"station": "Rodriguez", "current_el_m": None, "alert_el_m": 28.80, "alarm_el_m": 29.80, "critical_el_m": 30.70,
          "lag_hr": 1, "attenuation": 0.94, "stage_m_per_100cms": 0.12, "local_rain_m_per_10mm": 0.06},
-        {"station": "Nangka", "current_el_m": 22.21, "alert_el_m": 16.50, "alarm_el_m": 17.10, "critical_el_m": 17.70,
+        {"station": "Nangka", "current_el_m": None, "alert_el_m": 16.50, "alarm_el_m": 17.10, "critical_el_m": 17.70,
          "lag_hr": 2, "attenuation": 0.90, "stage_m_per_100cms": 0.14, "local_rain_m_per_10mm": 0.08},
-        {"station": "Sto Nino", "current_el_m": 15.51, "alert_el_m": 15.00, "alarm_el_m": 16.00, "critical_el_m": 17.00,
+        {"station": "Sto Nino", "current_el_m": None, "alert_el_m": 15.00, "alarm_el_m": 16.00, "critical_el_m": 17.00,
          "lag_hr": 3, "attenuation": 0.86, "stage_m_per_100cms": 0.16, "local_rain_m_per_10mm": 0.10},
-        {"station": "Tumana Bridge", "current_el_m": 11.97, "alert_el_m": 17.26, "alarm_el_m": 18.26, "critical_el_m": 19.26,
+        {"station": "Tumana Bridge", "current_el_m": None, "alert_el_m": 17.26, "alarm_el_m": 18.26, "critical_el_m": 19.26,
          "lag_hr": 4, "attenuation": 0.82, "stage_m_per_100cms": 0.18, "local_rain_m_per_10mm": 0.12},
     ]
 )
 
 PAGASA_WATER_URL = "https://pasig-marikina-tullahanffws.pagasa.dost.gov.ph/water/map.do"
+PAGASA_WATER_TABLE_URL = "https://pasig-marikina-tullahanffws.pagasa.dost.gov.ph/water/table.do"
+PAGASA_MAIN_URL = "https://pasig-marikina-tullahanffws.pagasa.dost.gov.ph/main.do"
 PAGASA_RAIN_URL = "https://pasig-marikina-tullahanffws.pagasa.dost.gov.ph/rainfall/map.do"
+LIVE_LEVEL_TTL_SECONDS = 300
+
+TARGET_STATIONS = ["Montalban", "Rodriguez", "Nangka", "Sto Nino", "Tumana Bridge"]
+
+
+# -----------------------------------------------------------------------------
+# LIVE PAGASA RIVER-LEVEL INGESTION
+# -----------------------------------------------------------------------------
+def _norm_text(value) -> str:
+    """Normalize station labels so Sto. Niño / Sto Nino and punctuation match."""
+    value = "" if value is None else str(value)
+    value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    value = value.lower().replace(".", " ").replace("-", " ")
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def canonical_station_name(value):
+    t = _norm_text(value)
+    if "tumana" in t:
+        return "Tumana Bridge"
+    if "sto nino" in t:
+        return "Sto Nino"
+    if t == "montalban" or " montalban " in f" {t} ":
+        return "Montalban"
+    if t == "rodriguez" or " rodriguez " in f" {t} ":
+        return "Rodriguez"
+    if t == "nangka" or " nangka " in f" {t} ":
+        return "Nangka"
+    return None
+
+
+def _number(value):
+    if value is None:
+        return None
+    s = str(value).strip().replace(",", "")
+    if not s or s in {"-", "--", "No Data", "No Data."}:
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    return float(m.group(0)) if m else None
+
+
+def _parse_pagasa_timestamp(page_text):
+    m = re.search(r"Time\s*:\s*(20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2})", page_text, flags=re.I)
+    if not m:
+        return None
+    raw = m.group(1).replace("/", "-")
+    try:
+        ts = pd.Timestamp(raw)
+        return ts.tz_localize(TZ) if ts.tzinfo is None else ts.tz_convert(TZ)
+    except Exception:
+        return None
+
+
+def _age_minutes(ts):
+    if ts is None or pd.isna(ts):
+        return None
+    try:
+        now_local = pd.Timestamp.now(tz=TZ)
+        t = pd.Timestamp(ts)
+        if t.tzinfo is None:
+            t = t.tz_localize(TZ)
+        else:
+            t = t.tz_convert(TZ)
+        return max(0.0, (now_local - t).total_seconds() / 60.0)
+    except Exception:
+        return None
+
+
+def _trend_from_values(current, previous):
+    if current is None or previous is None:
+        return "Unknown"
+    d = float(current) - float(previous)
+    if d > 0.005:
+        return "Rising"
+    if d < -0.005:
+        return "Falling"
+    return "Stable"
+
+
+def parse_pagasa_water_html(html: str, source_url: str) -> pd.DataFrame:
+    """Parse PAGASA server-rendered water-level tables when data are present."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    page_text = soup.get_text(" ", strip=True)
+    observed_at = _parse_pagasa_timestamp(page_text)
+    rows = []
+
+    for tr in soup.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+        if not cells:
+            continue
+        station = canonical_station_name(cells[0])
+        if station not in TARGET_STATIONS:
+            continue
+
+        vals = cells[1:]
+        current = minus30 = minus1h = minus2h = alert = alarm = critical = None
+        # PAGASA /water/table.do: station, current, -30m, -1h, -2h, alert, alarm, critical
+        if len(vals) >= 7:
+            current, minus30, minus1h, minus2h, alert, alarm, critical = [_number(v) for v in vals[:7]]
+        # PAGASA /water/map.do: station, current, alert, alarm, critical
+        elif len(vals) >= 4:
+            current, alert, alarm, critical = [_number(v) for v in vals[:4]]
+        else:
+            continue
+
+        if current is None:
+            continue
+        delta_1h = (current - minus1h) if minus1h is not None else None
+        rate_1h = delta_1h
+        trend = _trend_from_values(current, minus30 if minus30 is not None else minus1h)
+        rows.append({
+            "station": station,
+            "live_el_m": current,
+            "minus30_el_m": minus30,
+            "minus1h_el_m": minus1h,
+            "minus2h_el_m": minus2h,
+            "delta_1h_m": delta_1h,
+            "rate_m_per_hr": rate_1h,
+            "alert_el_m_live": alert,
+            "alarm_el_m_live": alarm,
+            "critical_el_m_live": critical,
+            "trend": trend,
+            "observed_at": observed_at,
+            "data_age_min": _age_minutes(observed_at),
+            "source": "PAGASA FFWS direct",
+            "quality": "Official direct",
+            "estimated": False,
+            "source_url": source_url,
+        })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).drop_duplicates(subset=["station"], keep="first")
+
+
+def parse_pagasa_pasted_table(text: str) -> pd.DataFrame:
+    """Parse text copied directly from PAGASA /water/map.do.
+
+    Expected columns: Station, Current EL, Alert EL, Alarm EL, Critical EL.
+    Asterisks and (*) flags are tolerated. Only the five Marikina-model
+    stations are retained.
+    """
+    text = text or ""
+    observed_at = _parse_pagasa_timestamp(text)
+    rows = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip().strip("*").strip()
+        if not line:
+            continue
+        # The PAGASA table copies cleanly as tab-separated text. Also accept
+        # two-or-more spaces for users copying through other browsers.
+        parts = [p.strip().strip("*").strip() for p in re.split(r"\t+|\s*\|\s*|\s{2,}", line) if p.strip()]
+        if len(parts) < 2:
+            continue
+        station = canonical_station_name(parts[0])
+        if station not in TARGET_STATIONS:
+            continue
+        current = _number(parts[1] if len(parts) > 1 else None)
+        alert = _number(parts[2] if len(parts) > 2 else None)
+        alarm = _number(parts[3] if len(parts) > 3 else None)
+        critical = _number(parts[4] if len(parts) > 4 else None)
+        if current is None:
+            continue
+        rows.append({
+            "station": station,
+            "live_el_m": current,
+            "minus30_el_m": None,
+            "minus1h_el_m": None,
+            "minus2h_el_m": None,
+            "delta_1h_m": None,
+            "rate_m_per_hr": None,
+            "alert_el_m_live": alert,
+            "alarm_el_m_live": alarm,
+            "critical_el_m_live": critical,
+            "trend": "Unknown",
+            "observed_at": observed_at,
+            "data_age_min": _age_minutes(observed_at),
+            "source": "PAGASA Water Level Map — pasted table",
+            "quality": "Official PAGASA table paste",
+            "estimated": False,
+            "source_url": PAGASA_WATER_URL,
+        })
+    return pd.DataFrame(rows).drop_duplicates(subset=["station"], keep="first") if rows else pd.DataFrame()
+
+
+def _pagasa_session_get(session: requests.Session, url: str, timeout: int = 20) -> str:
+    """Browser-like request to the official PAGASA Java web application."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-PH,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": "https://pasig-marikina-tullahanffws.pagasa.dost.gov.ph/main.do",
+    }
+    r = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    return r.text
+
+
+@st.cache_data(ttl=LIVE_LEVEL_TTL_SECONDS, show_spinner=False)
+def fetch_live_river_levels():
+    """Fetch Current EL from the user's authoritative PAGASA Water Level Map.
+
+    /water/map.do is authoritative for Current/Alert/Alarm/Critical. The
+    official /water/table.do page is used only to enrich -30 min / -1 h / -2 h
+    trend fields when it is available; it never replaces the map Current EL.
+    No third-party river-level fallback is used.
+    """
+    errors = []
+    map_df = pd.DataFrame()
+    table_df = pd.DataFrame()
+    session = requests.Session()
+
+    # Warm the Java web session first. Failure here is non-fatal.
+    try:
+        _pagasa_session_get(session, PAGASA_MAIN_URL, timeout=12)
+    except Exception as exc:
+        errors.append(f"Session warm-up: {exc}")
+
+    try:
+        html = _pagasa_session_get(session, PAGASA_WATER_URL)
+        map_df = parse_pagasa_water_html(html, PAGASA_WATER_URL)
+        if map_df.empty:
+            errors.append("PAGASA Water Level Map loaded but returned no usable station rows.")
+        else:
+            map_df["source"] = "PAGASA Water Level Map"
+            map_df["quality"] = "Official PAGASA direct"
+    except Exception as exc:
+        errors.append(f"{PAGASA_WATER_URL}: {exc}")
+
+    # Optional official history enrichment; map values remain authoritative.
+    try:
+        html_hist = _pagasa_session_get(session, PAGASA_WATER_TABLE_URL)
+        table_df = parse_pagasa_water_html(html_hist, PAGASA_WATER_TABLE_URL)
+    except Exception as exc:
+        errors.append(f"History table: {exc}")
+
+    result = map_df.copy()
+    if not result.empty and not table_df.empty:
+        hist_cols = [
+            "station", "minus30_el_m", "minus1h_el_m", "minus2h_el_m",
+            "delta_1h_m", "rate_m_per_hr", "trend"
+        ]
+        hist = table_df[hist_cols].drop_duplicates("station")
+        result = result.drop(columns=[c for c in hist_cols[1:] if c in result.columns], errors="ignore")
+        result = result.merge(hist, on="station", how="left")
+        # Recalculate trend against the map Current EL, not the table Current EL.
+        result["delta_1h_m"] = result.apply(
+            lambda r: float(r["live_el_m"]) - float(r["minus1h_el_m"])
+            if pd.notna(r.get("minus1h_el_m")) else None,
+            axis=1,
+        )
+        result["rate_m_per_hr"] = result["delta_1h_m"]
+        result["trend"] = result.apply(
+            lambda r: _trend_from_values(
+                r.get("live_el_m"),
+                r.get("minus30_el_m") if pd.notna(r.get("minus30_el_m")) else r.get("minus1h_el_m")
+            ), axis=1
+        )
+
+    if not result.empty:
+        result = result.drop_duplicates(subset=["station"], keep="first")
+        result["data_age_min"] = pd.to_numeric(result.get("data_age_min"), errors="coerce")
+
+    meta = {
+        "errors": errors,
+        "direct_count": len(result) if not result.empty else 0,
+        "fetched_at": pd.Timestamp.now(tz=TZ),
+        "authoritative_url": PAGASA_WATER_URL,
+    }
+    return result, meta
+
+
+def seed_station_inputs_from_live(defaults: pd.DataFrame, live: pd.DataFrame) -> pd.DataFrame:
+    """Seed Current EL and thresholds from live feed while preserving manual-edit capability."""
+    seeded = defaults.copy()
+    if live is None or live.empty:
+        return seeded
+    live_by_station = live.set_index("station")
+    for idx, row in seeded.iterrows():
+        station = row["station"]
+        if station not in live_by_station.index:
+            continue
+        lrow = live_by_station.loc[station]
+        live_el = _number(lrow.get("live_el_m"))
+        if live_el is not None:
+            seeded.at[idx, "current_el_m"] = live_el
+        for source_col, target_col in [
+            ("alert_el_m_live", "alert_el_m"),
+            ("alarm_el_m_live", "alarm_el_m"),
+            ("critical_el_m_live", "critical_el_m"),
+        ]:
+            val = _number(lrow.get(source_col))
+            if val is not None:
+                seeded.at[idx, target_col] = val
+    return seeded
 
 
 # -----------------------------------------------------------------------------
@@ -285,6 +614,161 @@ def scenario_summary(stage_df: pd.DataFrame, stations: pd.DataFrame, scenario_na
     return pd.DataFrame(rows)
 
 
+def build_forecast_map(
+    operational: pd.DataFrame,
+    stations: pd.DataFrame,
+    forecast: pd.DataFrame,
+    current_wawa_el: float,
+    fsl_m: float,
+    initial_spill: float,
+    peak_wawa_el: float,
+    peak_spill_cms: float,
+    peak_spill_time,
+):
+    """Create a FloodWatch-style interactive map for Wawa-to-Marikina monitoring."""
+    m = folium.Map(
+        location=[14.67, 121.145],
+        zoom_start=11,
+        tiles="OpenStreetMap",
+        control_scale=True,
+    )
+
+    # Schematic river/gauge connection. This is a monitoring-path visualization,
+    # not a surveyed river centerline.
+    route_points = [WAWA_DAM_COORD]
+    for station_name in ["Montalban", "Rodriguez", "Nangka", "Sto Nino", "Tumana Bridge"]:
+        if station_name in STATION_MAP_COORDS:
+            route_points.append(STATION_MAP_COORDS[station_name])
+    folium.PolyLine(
+        route_points,
+        color="#2563eb",
+        weight=4,
+        opacity=0.60,
+        dash_array="8,6",
+        tooltip="Upper Wawa → downstream monitoring sequence (schematic)",
+    ).add_to(m)
+
+    dam_group = folium.FeatureGroup(name="Upper Wawa Dam", show=True)
+    spill_state = "SPILLING" if float(current_wawa_el) >= float(fsl_m) else "BELOW FSL"
+    dam_popup = f"""
+    <div style='font-size:13px;min-width:255px'>
+      <b>Upper Wawa Dam</b><br>
+      State: <b>{spill_state}</b><br>
+      Current EL: <b>{current_wawa_el:.2f} m</b><br>
+      Spill crest/FSL: {fsl_m:.2f} m<br>
+      Assumed current spill: <b>{initial_spill:.0f} m³/s</b><br>
+      Likely max EL: <b>{peak_wawa_el:.2f} m</b><br>
+      Likely max spill: <b>{peak_spill_cms:.0f} m³/s</b><br>
+      Max-spill timing: <b>{pd.Timestamp(peak_spill_time).strftime('%b %d, %I:%M %p')} PHT</b><br>
+      <small>Spill discharge is from the app's assumed temporary rating curve.</small>
+    </div>
+    """
+    folium.Marker(
+        location=list(WAWA_DAM_COORD),
+        tooltip=f"Upper Wawa | {spill_state} | {initial_spill:.0f} m³/s",
+        popup=folium.Popup(dam_popup, max_width=360),
+        icon=folium.Icon(color="blue", icon="tint", prefix="fa"),
+    ).add_to(dam_group)
+    dam_group.add_to(m)
+
+    station_group = folium.FeatureGroup(name="Forecast River Stations", show=True)
+    meta = stations.set_index("station")
+    for _, row in operational.iterrows():
+        name = row["station"]
+        if name not in STATION_MAP_COORDS or name not in meta.index:
+            continue
+        sm = meta.loc[name]
+        status = str(row.get("likely_status", "Unknown"))
+        color = MAP_STATUS_COLORS.get(status, "gray")
+        rise = max(float(row.get("likely_rise_m", 0.0) or 0.0), 0.0)
+        radius = 8 + min(rise * 9.0, 22.0)
+
+        popup = f"""
+        <div style='font-size:13px;min-width:280px'>
+          <b>{name}</b><br>
+          Likely status: <b>{status}</b><br>
+          Current EL: <b>{float(row['current_el_m']):.2f} m</b><br>
+          Expected rise: <b>+{rise:.2f} m</b><br>
+          Low peak: {float(row['low_peak_m']):.2f} m<br>
+          Likely peak: <b>{float(row['likely_peak_m']):.2f} m</b><br>
+          High peak: {float(row['high_peak_m']):.2f} m<br>
+          Likely peak time: <b>{row['likely_peak_time']} PHT</b><br><br>
+          Alert: {float(sm['alert_el_m']):.2f} m<br>
+          Alarm: {float(sm['alarm_el_m']):.2f} m<br>
+          Critical: {float(sm['critical_el_m']):.2f} m<br>
+          <small>Marker size represents predicted rise; color represents likely peak status.</small>
+        </div>
+        """
+        folium.CircleMarker(
+            location=list(STATION_MAP_COORDS[name]),
+            radius=radius,
+            color=color,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.65,
+            weight=3,
+            tooltip=(
+                f"{name} | {status} | current {float(row['current_el_m']):.2f} m → "
+                f"likely {float(row['likely_peak_m']):.2f} m (+{rise:.2f} m)"
+            ),
+            popup=folium.Popup(popup, max_width=390),
+        ).add_to(station_group)
+    station_group.add_to(m)
+
+    rain_group = folium.FeatureGroup(name="120h Rainfall Nodes", show=True)
+    for area, coords in RAIN_POINTS.items():
+        total = float(forecast[area].sum()) if area in forecast.columns else 0.0
+        peak = float(forecast[area].max()) if area in forecast.columns else 0.0
+        if area in forecast.columns and len(forecast):
+            idx = forecast[area].idxmax()
+            peak_time = pd.Timestamp(forecast.loc[idx, "time"]).strftime("%b %d, %I:%M %p")
+        else:
+            peak_time = "No data"
+        rr = 7 + min(total / 12.0, 18.0)
+        popup = f"""
+        <div style='font-size:13px;min-width:230px'>
+          <b>{area} rainfall node</b><br>
+          Next 120h total: <b>{total:.1f} mm</b><br>
+          Peak hourly rain: <b>{peak:.1f} mm/h</b><br>
+          Peak forecast time: {peak_time} PHT<br>
+          <small>Open-Meteo point forecast; not an official PAGASA gauge.</small>
+        </div>
+        """
+        folium.CircleMarker(
+            location=list(coords),
+            radius=rr,
+            color="cadetblue",
+            fill=True,
+            fill_color="cadetblue",
+            fill_opacity=0.25,
+            weight=2,
+            tooltip=f"{area} | 120h rain {total:.1f} mm | peak {peak:.1f} mm/h",
+            popup=folium.Popup(popup, max_width=330),
+        ).add_to(rain_group)
+    rain_group.add_to(m)
+
+    legend = """
+    <div style="position: fixed; bottom: 35px; left: 35px; z-index: 9999;
+                background: white; border: 2px solid #94a3b8; border-radius: 8px;
+                padding: 10px 12px; font-size: 12px; box-shadow: 0 1px 5px rgba(0,0,0,.2);">
+      <b>Likely peak status</b><br>
+      <span style='color:green'>●</span> Normal &nbsp;
+      <span style='color:orange'>●</span> Alert<br>
+      <span style='color:red'>●</span> Alarm &nbsp;
+      <span style='color:darkred'>●</span> Critical<br>
+      <span style='color:cadetblue'>●</span> Rainfall node<br>
+      <small>Station marker size = predicted rise</small>
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend))
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    all_points = [WAWA_DAM_COORD] + list(STATION_MAP_COORDS.values()) + list(RAIN_POINTS.values())
+    m.fit_bounds([[min(p[0] for p in all_points), min(p[1] for p in all_points)],
+                  [max(p[0] for p in all_points), max(p[1] for p in all_points)]], padding=(25, 25))
+    return m
+
+
 # -----------------------------------------------------------------------------
 # UI
 # -----------------------------------------------------------------------------
@@ -323,28 +807,219 @@ with st.sidebar:
     high_rain_factor = st.slider("High scenario rainfall factor", 1.00, 1.80, 1.30, 0.05)
     high_c_offset = st.slider("High scenario runoff-C addition", 0.00, 0.20, 0.10, 0.01)
 
-    refresh = st.button("Refresh rainfall now", use_container_width=True)
+    st.divider()
+    st.header("Official River-Level Feed")
+    st.caption("Authoritative Current EL source: PAGASA Pasig-Marikina-Tullahan FFWS Water Level Map. No third-party river-level fallback is used.")
+    st.caption("River levels cache for 5 minutes; Open-Meteo rainfall cache for 10 minutes.")
+
+    refresh = st.button("Refresh official PAGASA + rainfall now", use_container_width=True)
     if refresh:
         st.cache_data.clear()
         st.rerun()
 
-    st.link_button("Open PAGASA Water Level", PAGASA_WATER_URL, use_container_width=True)
+    st.link_button("Open official PAGASA Water Level Map", PAGASA_WATER_URL, use_container_width=True)
     st.link_button("Open PAGASA Rainfall", PAGASA_RAIN_URL, use_container_width=True)
 
 
-# Editable station table
-st.subheader("1) Current PAGASA River Levels + Temporary Calibration")
+# Live station data + editable model inputs
+st.subheader("1) PAGASA River Levels + Paste Fallback + Temporary Calibration")
 st.caption(
-    "Update Current EL from the latest PAGASA table. The lag, attenuation and stage-sensitivity columns are experimental and can be calibrated after real events."
+    f"Build: {BUILD_ID} • Authoritative river-level reference: {PAGASA_WATER_URL}"
+)
+st.caption(
+    "The app tries the official PAGASA Water Level Map automatically. If that request fails or returns No Data, "
+    "the app does not substitute old sample river levels. Instead, paste the table copied from the same PAGASA page below."
+)
+
+# Try the official page first. A failure is treated as an availability condition,
+# not as a model error, because the user can paste the exact official table below.
+try:
+    direct_levels, live_meta = fetch_live_river_levels()
+except Exception as exc:
+    direct_levels = pd.DataFrame()
+    live_meta = {
+        "errors": [str(exc)],
+        "direct_count": 0,
+        "fetched_at": pd.Timestamp.now(tz=TZ),
+        "authoritative_url": PAGASA_WATER_URL,
+    }
+
+auto_ok = direct_levels is not None and not direct_levels.empty
+if auto_ok:
+    st.success(
+        f"Automatic PAGASA read succeeded: {len(direct_levels)}/{len(TARGET_STATIONS)} model stations found. "
+        "You may leave the paste box blank."
+    )
+else:
+    st.warning(
+        "Automatic PAGASA extraction is unavailable right now. This is not treated as a model failure. "
+        "Open the official PAGASA Water Level Map, copy its table, and paste it in the blank field below."
+    )
+
+st.link_button(
+    "Open official PAGASA Water Level Map to copy values",
+    PAGASA_WATER_URL,
+    use_container_width=True,
+)
+
+pagasa_paste = st.text_area(
+    "Paste PAGASA Water Level table here",
+    value="",
+    height=210,
+    placeholder=(
+        "Paste the full table exactly as copied from PAGASA. Example:\n\n"
+        "Angono\t12.15(*)\t-\t-\t-*\n"
+        "Burgos\t28.54\t27.40\t27.90\t28.40\n"
+        "Montalban\t27.04(*)\t22.40\t23.00\t23.60\n"
+        "Nangka\t22.21(*)\t16.50\t17.10\t17.70\n"
+        "Rodriguez\t29.84\t28.80\t29.80\t30.70\n"
+        "Sto Nino\t17.22\t15.00\t16.00\t17.00\n"
+        "Tumana Bridge\t11.97\t17.26\t18.26\t19.26"
+    ),
+    help=(
+        "You may paste the ENTIRE PAGASA table. The parser accepts tabs, repeated spaces, (*) flags, and leading/trailing asterisks. "
+        "Stations outside this Marikina model are ignored automatically."
+    ),
+    key="pagasa_manual_paste",
+)
+
+pasted_levels = parse_pagasa_pasted_table(pagasa_paste) if pagasa_paste.strip() else pd.DataFrame()
+paste_ok = pasted_levels is not None and not pasted_levels.empty
+
+# Preview what the parser understood BEFORE those values enter the hydraulic model.
+if pagasa_paste.strip():
+    if paste_ok:
+        parsed_names = set(pasted_levels["station"].tolist())
+        missing_from_paste = [s for s in TARGET_STATIONS if s not in parsed_names]
+        preview = pasted_levels[[
+            "station", "live_el_m", "alert_el_m_live", "alarm_el_m_live", "critical_el_m_live"
+        ]].copy()
+        st.markdown("**Parsed PAGASA values**")
+        st.dataframe(
+            preview.rename(columns={
+                "station": "Station",
+                "live_el_m": "Current EL (m)",
+                "alert_el_m_live": "Alert EL",
+                "alarm_el_m_live": "Alarm EL",
+                "critical_el_m_live": "Critical EL",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+        if missing_from_paste:
+            st.warning(
+                "The paste was read, but these model stations were not found: " + ", ".join(missing_from_paste) + ". "
+                "You can repaste the complete official table or fill the missing Current EL manually below."
+            )
+        else:
+            st.success("Paste validated: all five Marikina-model stations were found.")
+    else:
+        st.warning(
+            "Text was pasted, but no Marikina-model station rows could be parsed. "
+            "Copy the rows directly from the PAGASA Water Level Map and paste them without reformatting."
+        )
+
+# Normal rule requested by the user:
+#   1) automatic official PAGASA values when available;
+#   2) otherwise use the user's pasted official PAGASA table;
+#   3) never use stale sample Current EL values.
+# If automatic values exist, an explicit checkbox allows a fresh browser copy to
+# override them when the user knows the browser table is newer.
+use_paste_override = False
+if auto_ok and paste_ok:
+    use_paste_override = st.checkbox(
+        "Use my pasted PAGASA table instead of the automatic read for this run",
+        value=False,
+        help="Enable this if the table visible in your browser is newer than the server response received by Streamlit.",
+    )
+
+if auto_ok and not use_paste_override:
+    live_levels = direct_levels.copy()
+    source_mode = "Automatic official PAGASA"
+elif paste_ok:
+    live_levels = pasted_levels.copy()
+    source_mode = "Official PAGASA table — manual paste"
+else:
+    live_levels = pd.DataFrame()
+    source_mode = "Waiting for PAGASA data"
+
+station_seed = seed_station_inputs_from_live(DEFAULT_STATIONS, live_levels)
+
+if live_levels is not None and not live_levels.empty:
+    live_display = live_levels.copy()
+    threshold_lookup = station_seed.set_index("station")
+    statuses = []
+    for _, lr in live_display.iterrows():
+        sname = lr["station"]
+        if sname in threshold_lookup.index:
+            sm = threshold_lookup.loc[sname]
+            statuses.append(stage_status(lr["live_el_m"], sm["alert_el_m"], sm["alarm_el_m"], sm["critical_el_m"]))
+        else:
+            statuses.append("Unknown")
+    live_display["status"] = statuses
+    live_display["observed"] = live_display["observed_at"].apply(
+        lambda x: pd.Timestamp(x).strftime("%b %d, %I:%M %p") if x is not None and not pd.isna(x) else "Not included"
+    )
+    live_display["age_min"] = live_display["data_age_min"].apply(
+        lambda x: round(float(x), 0) if x is not None and not pd.isna(x) else None
+    )
+    live_display["delta_1h_m"] = pd.to_numeric(live_display["delta_1h_m"], errors="coerce").round(2)
+    live_display["rate_m_per_hr"] = pd.to_numeric(live_display["rate_m_per_hr"], errors="coerce").round(2)
+
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Stations loaded", f"{len(live_display)}/{len(TARGET_STATIONS)}")
+    s2.metric("Data source", source_mode)
+    s3.metric("Automatic fetch", "Available" if auto_ok else "Unavailable")
+
+    if source_mode == "Official PAGASA table — manual paste":
+        st.info(
+            "The hydraulic forecast is using the values you pasted from the official PAGASA Water Level Map. "
+            "Because the copied map table does not normally include observation history, Δ1h/rate may remain blank."
+        )
+
+    show_cols = [
+        "station", "live_el_m", "status", "delta_1h_m", "rate_m_per_hr", "trend",
+        "observed", "age_min", "quality", "source"
+    ]
+    st.dataframe(
+        live_display[show_cols].rename(columns={
+            "station": "Station",
+            "live_el_m": "Current EL (m)",
+            "status": "Current status",
+            "delta_1h_m": "Δ1h (m)",
+            "rate_m_per_hr": "Rate (m/hr)",
+            "trend": "Trend",
+            "observed": "Observed",
+            "age_min": "Age (min)",
+            "quality": "Quality",
+            "source": "Source",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+else:
+    st.info(
+        "No river level has entered the forecast model yet. Paste the current official PAGASA table above. "
+        "The 120-hour river-stage forecast will start only after all required Current EL values are available."
+    )
+
+if live_meta.get("errors"):
+    with st.expander("Automatic PAGASA fetch diagnostics (optional)"):
+        st.caption("These messages only explain why the automatic read may have failed; manual PAGASA paste remains valid.")
+        for err in live_meta["errors"]:
+            st.code(err)
+
+st.caption(
+    "Calibration coefficients below remain experimental. Current EL and warning thresholds are seeded from the selected official PAGASA source above."
 )
 stations = st.data_editor(
-    DEFAULT_STATIONS,
+    station_seed,
     use_container_width=True,
     hide_index=True,
     num_rows="fixed",
     column_config={
         "station": st.column_config.TextColumn("Station", disabled=True),
-        "current_el_m": st.column_config.NumberColumn("Current EL (m)", format="%.2f"),
+        "current_el_m": st.column_config.NumberColumn("Model Current EL (m)", format="%.2f"),
         "alert_el_m": st.column_config.NumberColumn("Alert EL", format="%.2f"),
         "alarm_el_m": st.column_config.NumberColumn("Alarm EL", format="%.2f"),
         "critical_el_m": st.column_config.NumberColumn("Critical EL", format="%.2f"),
@@ -359,6 +1034,14 @@ stations = st.data_editor(
 numeric_cols = [c for c in stations.columns if c != "station"]
 for c in numeric_cols:
     stations[c] = pd.to_numeric(stations[c], errors="coerce")
+
+missing_current = stations.loc[stations["current_el_m"].isna(), "station"].tolist()
+if missing_current:
+    st.warning(
+        "Waiting for Current EL for: " + ", ".join(missing_current) + ". "
+        "Paste the official PAGASA table above (recommended) or deliberately enter the missing EL in the calibration table."
+    )
+    st.stop()
 
 # Fetch rainfall
 try:
@@ -553,6 +1236,28 @@ for station in stations["station"]:
 operational = pd.DataFrame(rows)
 st.dataframe(operational, use_container_width=True, hide_index=True)
 
+st.subheader("5) Upper Wawa → Marikina Forecast Map")
+st.caption(
+    "Interactive monitoring map: river-station color = likely peak status; marker size = predicted rise. "
+    "Rainfall nodes and Upper Wawa can be switched on/off in the layer control."
+)
+forecast_map = build_forecast_map(
+    operational=operational,
+    stations=stations,
+    forecast=forecast,
+    current_wawa_el=current_wawa_el,
+    fsl_m=fsl_m,
+    initial_spill=initial_spill,
+    peak_wawa_el=float(peak_level_row["wawa_level_m"]),
+    peak_spill_cms=float(peak_spill_row["spill_cms"]),
+    peak_spill_time=peak_spill_row["time"],
+)
+st_folium(forecast_map, width=None, height=610, returned_objects=[])
+st.caption(
+    "Map note: Upper Wawa uses a mapped dam coordinate. Downstream station points are initial approximate plotting locations for visualization only; "
+    "they do not affect the forecast calculation and should be replaced with verified gauge coordinates when available."
+)
+
 selected_station = st.selectbox("Station hydrograph", stations["station"].tolist(), index=min(3, len(stations)-1))
 station_meta = stations[stations["station"] == selected_station].iloc[0]
 
@@ -573,7 +1278,7 @@ component_chart = selected_likely[["wawa_rise_m", "local_rain_rise_m", "rise_m"]
 st.markdown("**Likely predicted rise decomposition**")
 st.line_chart(component_chart, height=280)
 
-st.subheader("5) Calibration / Interpretation")
+st.subheader("6) Calibration / Interpretation")
 st.markdown(
     """
 **How to improve this after each real rain event:**
@@ -606,6 +1311,8 @@ with d3:
     st.download_button("Download forecast summary", csv3, "marikina_forecast_summary.csv", "text/csv", use_container_width=True)
 
 st.info(
-    "Model status: EXPERIMENTAL / CALIBRATION MODE. Open-Meteo rainfall is forecast guidance, not an official PAGASA rainfall forecast. "
-    "PAGASA warning levels and official bulletins should override this simulation."
+    "Model status: EXPERIMENTAL / CALIBRATION MODE. The authoritative river-level reference is the official PAGASA "
+    "Pasig-Marikina-Tullahan FFWS Water Level Map. No third-party river-level fallback is used. If the official page "
+    "cannot be read automatically, the forecast stops unless an official table paste or manual Current EL is supplied. "
+    "Open-Meteo rainfall is forecast guidance, not an official PAGASA rainfall forecast. PAGASA warnings and bulletins override this simulation."
 )
